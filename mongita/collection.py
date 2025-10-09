@@ -212,9 +212,16 @@ def _doc_matches_slow_filters(doc, slow_filters):
             return False
 
         item_from_doc = _get_item_from_doc(doc, doc_key)
-        if isinstance(item_from_doc, list) and query_ops in item_from_doc:
+
+        if isinstance(query_ops, re.Pattern):
+            if isinstance(item_from_doc, str) and query_ops.search(item_from_doc):
+                continue
+            elif isinstance(item_from_doc, list):
+                if any(isinstance(x, str) and query_ops.search(x) for x in item_from_doc):
+                    continue
+        elif isinstance(item_from_doc, list) and query_ops in item_from_doc:
             continue
-        if item_from_doc == query_ops:
+        elif item_from_doc == query_ops:
             continue
         return False
     return True
@@ -367,10 +374,14 @@ def _update_item_in_doc(update_op, update_op_dict, doc):
             if not isinstance(value, (int, float)):
                 raise _failed_update_error(update_op, update_op_dict, doc,
                                            "Increment was not numeric")
-            elif not isinstance(ds.get(last_key), (int, float)):
+            current_value = ds.get(last_key)
+            if current_value is None:
+                ds[last_key] = value
+            elif not isinstance(current_value, (int, float)):
                 raise _failed_update_error(update_op, update_op_dict, doc,
                                            "Document value was not numeric")
-            ds[last_key] += value
+            else:
+                ds[last_key] += value
         elif update_op == '$push':
             if isinstance(ds.get(last_key), list):
                 ds[last_key].append(value)
@@ -799,13 +810,13 @@ class Collection():
                     replacement['_id'] = replacement.get('_id') or bson.ObjectId()
                     self.__insert_one(replacement)
                     self.__update_indicies([replacement], metadata)
-                    return UpdateResult(0, 1, replacement['_id'])
-                return UpdateResult(0, 0)
+                    return UpdateResult(0, 0, replacement['_id'])
+                return UpdateResult(0, 0, None)
             replacement['_id'] = doc_id
             metadata = self.__get_metadata()
             assert self._engine.put_doc(self.full_name, replacement)
             self.__update_indicies([replacement], metadata)
-            return UpdateResult(1, 1)
+            return UpdateResult(1, 1, None)
 
     def __find_one_id(self, filter, sort=None, skip=None, upsert=False):
         """
@@ -1009,7 +1020,7 @@ class Collection():
     def update_one(self, filter, update, upsert=False):
         """
         Find one document matching the filter and update it.
-        The 'upsert' parameter is not supported.
+        If upsert is True, insert a new document if none match.
 
         :param filter dict:
         :param update dict:
@@ -1020,25 +1031,44 @@ class Collection():
         _validate_filter(filter)
         _validate_update(update)
         self.__create()
-        if upsert:
-            raise MongitaNotImplementedError("Mongita does not support 'upsert' on "
-                                             "update operations. Use `replace_one`.")
 
         with self._engine.lock:
-            doc_ids = list(self.__find_ids(filter))
-            matched_count = len(doc_ids)
-            if not matched_count:
-                return UpdateResult(matched_count, 0)
+            doc_id = self.__find_one_id(filter)
+
+            if doc_id:
+                metadata = self.__get_metadata()
+                doc = self.__update_doc(doc_id, update)
+                self.__update_indicies([doc], metadata)
+                return UpdateResult(1, 1, None)
+
+            if not upsert:
+                return UpdateResult(0, 0, None)
+
+            # Upsert logic
+            new_doc = {}
+            for key, value in filter.items():
+                if isinstance(value, dict) and '$eq' in value:
+                    value = value['$eq']
+                if not isinstance(value, dict):
+                    ds, last_key = _get_datastructure_from_doc(new_doc, key)
+                    if ds is not None:
+                        ds[last_key] = value
+
+            for update_op, update_op_dict in update.items():
+                _update_item_in_doc(update_op, update_op_dict, new_doc)
+
+            new_doc['_id'] = new_doc.get('_id') or filter.get('_id') or bson.ObjectId()
+
             metadata = self.__get_metadata()
-            doc = self.__update_doc(doc_ids[0], update)
-            self.__update_indicies([doc], metadata)
-        return UpdateResult(matched_count, 1)
+            self.__insert_one(new_doc)
+            self.__update_indicies([new_doc], metadata)
+            return UpdateResult(0, 0, new_doc['_id'])
 
     @support_alert
     def update_many(self, filter, update, upsert=False):
         """
         Update every document matched by the filter.
-        The 'upsert' parameter is not supported.
+        If upsert is True, insert a new document if none match.
 
         :param filter dict:
         :param update dict:
@@ -1048,21 +1078,41 @@ class Collection():
         _validate_filter(filter)
         _validate_update(update)
         self.__create()
-        if upsert:
-            raise MongitaNotImplementedError("Mongita does not support 'upsert' "
-                                             "on update operations. Use `replace_one`.")
 
-        success_docs = []
-        matched_cnt = 0
         with self._engine.lock:
             doc_ids = list(self.__find_ids(filter))
+
+            if doc_ids:
+                success_docs = []
+                metadata = self.__get_metadata()
+                for doc_id in doc_ids:
+                    doc = self.__update_doc(doc_id, update)
+                    success_docs.append(doc)
+                self.__update_indicies(success_docs, metadata)
+                return UpdateResult(len(doc_ids), len(success_docs), None)
+
+            if not upsert:
+                return UpdateResult(0, 0, None)
+
+            # Upsert logic - insert one document
+            new_doc = {}
+            for key, value in filter.items():
+                if isinstance(value, dict) and '$eq' in value:
+                    value = value['$eq']
+                if not isinstance(value, dict):
+                    ds, last_key = _get_datastructure_from_doc(new_doc, key)
+                    if ds is not None:
+                        ds[last_key] = value
+
+            for update_op, update_op_dict in update.items():
+                _update_item_in_doc(update_op, update_op_dict, new_doc)
+
+            new_doc['_id'] = new_doc.get('_id') or filter.get('_id') or bson.ObjectId()
+
             metadata = self.__get_metadata()
-            for doc_id in doc_ids:
-                doc = self.__update_doc(doc_id, update)
-                success_docs.append(doc)
-                matched_cnt += 1
-            self.__update_indicies(success_docs, metadata)
-        return UpdateResult(matched_cnt, len(success_docs))
+            self.__insert_one(new_doc)
+            self.__update_indicies([new_doc], metadata)
+            return UpdateResult(0, 0, new_doc['_id'])
 
     @support_alert
     def delete_one(self, filter):

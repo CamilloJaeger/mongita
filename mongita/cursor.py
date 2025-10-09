@@ -29,11 +29,11 @@ def _validate_sort(key_or_list, direction=None):
 
 class Cursor():
     UNIMPLEMENTED = ['add_option', 'address', 'alive', 'allow_disk_use', 'batch_size',
-                     'collation', 'collection', 'comment', 'cursor_id', 'distinct',
+                     'collation', 'comment', 'cursor_id', 'distinct',
                      'explain', 'hint', 'max', 'max_await_time_ms',
                      'max_time_ms', 'min', 'remove_option', 'retrieved', 'rewind',
                      'session', 'where']
-    DEPRECATED = ['count', 'max_scan']
+    DEPRECATED = ['max_scan']
 
     def __init__(self, _find, filter, sort, limit, skip):
         self._find = _find
@@ -43,15 +43,79 @@ class Cursor():
         self._skip = skip or None
         self._cursor = None
 
+    @property
+    def collection(self):
+        """
+        The :class:`~mongita.collection.Collection` that this
+        :class:`~mongita.cursor.Cursor` is iterating.
+        """
+        return self._find.__self__
+
     def __getattr__(self, attr):
         if attr in self.DEPRECATED:
-            raise MongitaNotImplementedError.create_depr("Collection", attr)
+            raise MongitaNotImplementedError.create_depr("Cursor", attr)
         if attr in self.UNIMPLEMENTED:
             raise MongitaNotImplementedError.create("Cursor", attr)
         raise AttributeError()
 
-    def __getitem__(self, val):
-        raise MongitaNotImplementedError.create("Cursor", '__getitem__')
+    def __getitem__(self, key):
+        if self._cursor:
+            raise InvalidOperation("Cannot slice a cursor that has already been used.")
+
+        if isinstance(key, slice):
+            if key.step is not None and key.step != 1:
+                raise IndexError("Cursor slicing does not support step.")
+
+            new_cursor = self.clone()
+
+            start = key.start or 0
+            if start < 0:
+                raise IndexError("Negative indices are not supported.")
+
+            new_cursor._skip = (self._skip or 0) + start
+
+            if key.stop is not None:
+                if key.stop < 0:
+                    raise IndexError("Negative indices are not supported.")
+
+                if key.stop <= start:
+                    new_cursor._limit = 0
+                    return new_cursor
+
+                slice_len = key.stop - start
+
+                if self._limit is not None:
+                    if start >= self._limit:
+                        new_cursor._limit = 0
+                    else:
+                        new_cursor._limit = min(slice_len, self._limit - start)
+                else:
+                    new_cursor._limit = slice_len
+            else:  # key.stop is None
+                if self._limit is not None:
+                    if start >= self._limit:
+                        new_cursor._limit = 0
+                    else:
+                        new_cursor._limit = self._limit - start
+
+            return new_cursor
+
+        if isinstance(key, int):
+            if key < 0:
+                raise IndexError("Negative indices are not supported.")
+
+            c = self.clone()
+            if self._limit is not None and key >= self._limit:
+                raise IndexError("Cursor index out of range.")
+
+            c._skip = (self._skip or 0) + key
+            c._limit = 1
+            docs = list(c)
+            if not docs:
+                raise IndexError("Cursor index out of range.")
+            return docs[0]
+
+        raise TypeError(f"Cursor indices must be integers or slices, not {type(key).__name__}")
 
     def __iter__(self):
         for el in self._gen():
@@ -80,6 +144,22 @@ class Cursor():
         :rtype: dict
         """
         return next(self._gen())
+
+    @support_alert
+    def count(self, with_limit_and_skip=False):
+        """
+        DEPRECATED: Use collection.count_documents instead.
+        Counts the number of documents in this cursor's result set.
+        :param with_limit_and_skip bool: If True, respects limit and skip.
+        :rtype: int
+        """
+        if self._cursor:
+            raise InvalidOperation("Cannot count a cursor that has already been used.")
+
+        if with_limit_and_skip:
+            return len(list(self.clone()))
+
+        return self.collection.count_documents(self._filter)
 
     @support_alert
     def sort(self, key_or_list, direction=None):
