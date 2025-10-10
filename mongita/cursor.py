@@ -35,9 +35,10 @@ class Cursor():
                      'session', 'where']
     DEPRECATED = ['max_scan']
 
-    def __init__(self, _find, filter, sort, limit, skip):
+    def __init__(self, _find, filter, projection, sort, limit, skip):
         self._find = _find
         self._filter = filter
+        self._projection = projection
         self._sort = sort or []
         self._limit = limit or None
         self._skip = skip or None
@@ -131,8 +132,8 @@ class Cursor():
         """
         if self._cursor:
             return self._cursor
-        self._cursor = self._find(filter=self._filter, sort=self._sort,
-                                  limit=self._limit, skip=self._skip)
+        self._cursor = self._find(filter=self._filter, projection=self._projection,
+                                  sort=self._sort, limit=self._limit, skip=self._skip)
         return self._cursor
 
     @support_alert
@@ -217,7 +218,7 @@ class Cursor():
 
     @support_alert
     def clone(self):
-        return Cursor(self._find, self._filter, self._sort, self._limit, self._skip)
+        return Cursor(self._find, self._filter, self._projection, self._sort, self._limit, self._skip)
 
     @support_alert
     def close(self):

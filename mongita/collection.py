@@ -561,6 +561,72 @@ def _get_item_from_doc(doc, key):
     return doc.get(key)
 
 
+def _path_exists(doc, key):
+    """Checks if a path exists in a nested dictionary."""
+    current = doc
+    for part in key.split('.'):
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return True
+
+
+def _set_item_in_doc(doc, key, value):
+    """Sets a value in a nested dictionary using dot notation."""
+    parts = key.split('.')
+    current = doc
+    for part in parts[:-1]:
+        current = current.setdefault(part, {})
+    current[parts[-1]] = value
+
+
+def _delete_item_in_doc(doc, key):
+    """Deletes a key from a nested dictionary using dot notation."""
+    parts = key.split('.')
+    current = doc
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            return  # Path doesn't exist.
+        current = current[part]
+    if isinstance(current, dict) and parts[-1] in current:
+        del current[parts[-1]]
+
+
+def _apply_projection(doc, projection):
+    if not projection or not doc:
+        return doc
+
+    for proj_val in projection.values():
+        if isinstance(proj_val, dict):
+            if any(k.startswith('$') for k in proj_val):
+                raise MongitaNotImplementedError(
+                    "Complex projection operators like $slice or $elemMatch are not supported.")
+
+    values = {v for k, v in projection.items() if k != '_id'}
+    if 1 in values and 0 in values:
+        raise OperationFailure("Projection cannot have a mix of inclusion and exclusion.")
+
+    inclusion_mode = (1 in values) if values else (projection.get('_id', 1) == 1)
+
+    if inclusion_mode:
+        projected_doc = {}
+        if projection.get('_id', 1) and '_id' in doc:
+            projected_doc['_id'] = doc['_id']
+
+        for key, value in projection.items():
+            if value:
+                if _path_exists(doc, key):
+                    item = _get_item_from_doc(doc, key)
+                    _set_item_in_doc(projected_doc, key, item)
+        return projected_doc
+    else:  # exclusion mode
+        projected_doc = copy.deepcopy(doc)
+        for key, value in projection.items():
+            if not value:
+                _delete_item_in_doc(projected_doc, key)
+        return projected_doc
+
+
 def _make_idx_key(idx_key):
     """
     MongoDB is very liberal when it comes to what keys it can compare on.
@@ -912,11 +978,12 @@ class Collection():
         except StopIteration:
             return None
 
-    def __find_one(self, filter, sort, skip):
+    def __find_one(self, filter, projection, sort, skip):
         """
         Given the filter, return a single doc or None.
 
         :param filter dict:
+        :param projection dict|None:
         :param sort list[(key, direction)]|None
         :param skip int|None
         :rtype: dict|None
@@ -925,7 +992,8 @@ class Collection():
         if doc_id:
             doc = self._engine.get_doc(self.full_name, doc_id)
             if doc:
-                return copy.deepcopy(doc)
+                projected_doc = _apply_projection(doc, projection)
+                return copy.deepcopy(projected_doc)
 
     def __find_ids(self, filter, sort=None, limit=None, skip=None, metadata=None):
         """
@@ -1002,12 +1070,13 @@ class Collection():
                 if i == limit:
                     return
 
-    def __find(self, filter, sort=None, limit=None, skip=None, metadata=None, shallow=False):
+    def __find(self, filter, projection=None, sort=None, limit=None, skip=None, metadata=None, shallow=False):
         """
         Given a filter, find all docs that match this filter.
         This method returns a generator.
 
         :param filter dict:
+        :param projection dict|None:
         :param sort list[(key, direction)]|None:
         :param limit int|None:
         :param skip int|None:
@@ -1016,21 +1085,23 @@ class Collection():
         """
         gen = self.__find_ids(filter, sort, limit, skip, metadata=metadata)
 
-        if shallow:
-            for doc_id in gen:
-                doc = self._engine.get_doc(self.full_name, doc_id)
+        for doc_id in gen:
+            doc = self._engine.get_doc(self.full_name, doc_id)
+            if projection:
+                doc = _apply_projection(doc, projection)
+
+            if shallow:
                 yield doc
-        else:
-            for doc_id in gen:
-                doc = self._engine.get_doc(self.full_name, doc_id)
+            else:
                 yield copy.deepcopy(doc)
 
     @support_alert
-    def find_one(self, filter=None, sort=None, skip=None):
+    def find_one(self, filter=None, projection=None, sort=None, skip=None):
         """
         Return the first matching document.
 
         :param filter dict:
+        :param projection dict|None:
         :param sort list[(key, direction)]|None:
         :param skip int|None:
         :rtype: dict|None
@@ -1041,14 +1112,15 @@ class Collection():
 
         if sort is not None:
             sort = _validate_sort(sort)
-        return self.__find_one(filter, sort, skip)
+        return self.__find_one(filter, projection, sort, skip)
 
     @support_alert
-    def find(self, filter=None, sort=None, limit=None, skip=None):
+    def find(self, filter=None, projection=None, sort=None, limit=None, skip=None):
         """
         Return a cursor of all matching documents.
 
         :param filter dict:
+        :param projection dict|None:
         :param sort list[(key, direction)]|None:
         :param limit int|None:
         :param skip int|None:
@@ -1070,7 +1142,7 @@ class Collection():
             if skip < 0:
                 raise ValueError('Skip must be >=0')
 
-        return Cursor(self.__find, filter, sort, limit, skip)
+        return Cursor(self.__find, filter, projection, sort, limit, skip)
 
     def __update_doc(self, doc_id, update, array_filters=None):
         """
