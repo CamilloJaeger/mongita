@@ -16,6 +16,7 @@ from .results import InsertOneResult, InsertManyResult, DeleteResult, UpdateResu
 from .write_concern import WriteConcern
 
 
+ARRAY_FILTER_RE = re.compile(r"^(?P<path_to_array>.*?)\.\$\[(?P<identifier>[a-z0-9_]+)\](?P<path_in_element>\..*)?$")
 _SUPPORTED_FILTER_OPERATORS = ('$in', '$eq', '$gt', '$gte', '$lt', '$lte', '$ne', '$nin')
 _SUPPORTED_UPDATE_OPERATORS = ('$set', '$inc', '$push')
 _DEFAULT_METADATA = {
@@ -212,9 +213,16 @@ def _doc_matches_slow_filters(doc, slow_filters):
             return False
 
         item_from_doc = _get_item_from_doc(doc, doc_key)
-        if isinstance(item_from_doc, list) and query_ops in item_from_doc:
+
+        if isinstance(query_ops, re.Pattern):
+            if isinstance(item_from_doc, str) and query_ops.search(item_from_doc):
+                continue
+            elif isinstance(item_from_doc, list):
+                if any(isinstance(x, str) and query_ops.search(x) for x in item_from_doc):
+                    continue
+        elif isinstance(item_from_doc, list) and query_ops in item_from_doc:
             continue
-        if item_from_doc == query_ops:
+        elif item_from_doc == query_ops:
             continue
         return False
     return True
@@ -337,49 +345,123 @@ def _failed_update_error(update_op, update_op_dict, doc, msg):
                         ({update_op: update_op_dict}, doc, msg))
 
 
-def _update_item_in_doc(update_op, update_op_dict, doc):
+def _element_matches_array_filter(element, array_filter, identifier):
+    """
+    Checks if an array element matches a given array_filter condition.
+    `array_filter` is one of the documents from the `array_filters` list.
+    """
+    id_prefix = identifier + '.'
+    for key, query_ops in array_filter.items():
+        if key.startswith(id_prefix):
+            element_key = key[len(id_prefix):]
+            if not isinstance(element, dict):
+                return False
+            doc_v = _get_item_from_doc(element, element_key)
+            if not _doc_matches_agg(doc_v, query_ops):
+                return False
+        elif key == identifier:
+            if not _doc_matches_agg(element, query_ops):
+                return False
+    return True
+
+
+def _apply_update_op(update_op, container, key, value, doc, update_op_dict):
+    """
+    Apply a single update operation to a container (dict or list) at `key`.
+    """
+    # Helper to get current value from dict or list
+    def get_current_value(c, k):
+        if isinstance(c, dict):
+            return c.get(k)
+        if isinstance(c, list):
+            if isinstance(k, int) and 0 <= k < len(c):
+                return c[k]
+        return None
+
+    if update_op == '$set':
+        container[key] = value
+    elif update_op == '$inc':
+        if not isinstance(value, (int, float)):
+            raise _failed_update_error(update_op, update_op_dict, doc,
+                                       "Increment was not numeric")
+        current_value = get_current_value(container, key)
+
+        if current_value is None:
+            container[key] = value
+        elif not isinstance(current_value, (int, float)):
+            raise _failed_update_error(update_op, update_op_dict, doc,
+                                       "Document value was not numeric")
+        else:
+            container[key] += value
+    elif update_op == '$push':
+        current_value = get_current_value(container, key)
+
+        if isinstance(current_value, list):
+            current_value.append(value)
+        elif current_value is None:
+            container[key] = [value]
+        else:
+            raise _failed_update_error(update_op, update_op_dict, doc,
+                                       "Document value was not a list")
+
+
+def _update_item_in_doc(update_op, update_op_dict, doc, array_filters=None):
     """
     Given an $update_op, a {doc_key: value} update_op_dict, and a doc,
     Update the doc in-place at doc_key with the update operation.
-
-    e.g.
-    doc = {'hi': 'ma'}
-    update_op = '$set'
-    update_op_dict {'ma': 'pa'}
-    -> {'hi': 'pa'}
-
-    :param update_op str:
-    :param update_op_dict {str: value}:
-    :param doc dict:
-    :rtype: None
+    Handles regular updates and updates with array_filters.
     """
-
     for doc_key, value in update_op_dict.items():
-        ds, last_key = _get_datastructure_from_doc(doc, doc_key)
-        if isinstance(ds, list):
-            _rightpad(ds, last_key)
-        if ds is None:
-            raise _failed_update_error(update_op, update_op_dict, doc,
-                                       "Could not find item")
-        if update_op == '$set':
-            ds[last_key] = value
-        elif update_op == '$inc':
-            if not isinstance(value, (int, float)):
-                raise _failed_update_error(update_op, update_op_dict, doc,
-                                           "Increment was not numeric")
-            elif not isinstance(ds.get(last_key), (int, float)):
-                raise _failed_update_error(update_op, update_op_dict, doc,
-                                           "Document value was not numeric")
-            ds[last_key] += value
-        elif update_op == '$push':
-            if isinstance(ds.get(last_key), list):
-                ds[last_key].append(value)
-            elif last_key not in ds:
-                ds[last_key] = [value]
-            else:
-                raise _failed_update_error(update_op, update_op_dict, doc,
-                                           "Document value was not a list")
-        # Should never get an update key we don't recognize b/c _validate_update
+        match = ARRAY_FILTER_RE.match(doc_key)
+
+        if not match or not array_filters:
+            # Original logic for updates without array filters
+            ds, last_key = _get_datastructure_from_doc(doc, doc_key)
+            if isinstance(ds, list):
+                _rightpad(ds, last_key)
+            if ds is None:
+                raise _failed_update_error(update_op, {doc_key: value}, doc,
+                                           "Could not find item")
+            _apply_update_op(update_op, ds, last_key, value, doc, {doc_key: value})
+            continue
+
+        # New logic for array_filters
+        parts = match.groupdict()
+        path_to_array = parts['path_to_array']
+        identifier = parts['identifier']
+        path_in_element = parts['path_in_element']
+        if path_in_element:
+            path_in_element = path_in_element[1:]  # remove leading dot
+
+        # Find the array_filter for this identifier
+        af_doc = None
+        for f in array_filters:
+            if any(k.startswith(identifier + '.') or k == identifier for k in f.keys()):
+                af_doc = f
+                break
+
+        if not af_doc:
+            raise OperationFailure(f"No array filter found for identifier '{identifier}' in path '{doc_key}'")
+
+        target_array = _get_item_from_doc(doc, path_to_array)
+        if not isinstance(target_array, list):
+            continue
+
+        for i, element in enumerate(target_array):
+            if _element_matches_array_filter(element, af_doc, identifier):
+                if path_in_element:
+                    # Update a field inside the element
+                    ds, last_key = _get_datastructure_from_doc(element, path_in_element)
+                    if ds is None:
+                        raise _failed_update_error(
+                            update_op, {doc_key: value}, doc,
+                            f"Could not process path '{path_in_element}' in array element")
+                    if isinstance(ds, list):
+                        _rightpad(ds, last_key)
+                    _apply_update_op(update_op, ds, last_key, value, doc, {doc_key: value})
+                else:
+                    # Update the entire element
+                    _apply_update_op(update_op, target_array, i, value, doc, {doc_key: value})
 
 
 def _rightpad(item, desired_length):
@@ -477,6 +559,72 @@ def _get_item_from_doc(doc, key):
                 return None
         return item or None
     return doc.get(key)
+
+
+def _path_exists(doc, key):
+    """Checks if a path exists in a nested dictionary."""
+    current = doc
+    for part in key.split('.'):
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return True
+
+
+def _set_item_in_doc(doc, key, value):
+    """Sets a value in a nested dictionary using dot notation."""
+    parts = key.split('.')
+    current = doc
+    for part in parts[:-1]:
+        current = current.setdefault(part, {})
+    current[parts[-1]] = value
+
+
+def _delete_item_in_doc(doc, key):
+    """Deletes a key from a nested dictionary using dot notation."""
+    parts = key.split('.')
+    current = doc
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            return  # Path doesn't exist.
+        current = current[part]
+    if isinstance(current, dict) and parts[-1] in current:
+        del current[parts[-1]]
+
+
+def _apply_projection(doc, projection):
+    if not projection or not doc:
+        return doc
+
+    for proj_val in projection.values():
+        if isinstance(proj_val, dict):
+            if any(k.startswith('$') for k in proj_val):
+                raise MongitaNotImplementedError(
+                    "Complex projection operators like $slice or $elemMatch are not supported.")
+
+    values = {v for k, v in projection.items() if k != '_id'}
+    if 1 in values and 0 in values:
+        raise OperationFailure("Projection cannot have a mix of inclusion and exclusion.")
+
+    inclusion_mode = (1 in values) if values else (projection.get('_id', 1) == 1)
+
+    if inclusion_mode:
+        projected_doc = {}
+        if projection.get('_id', 1) and '_id' in doc:
+            projected_doc['_id'] = doc['_id']
+
+        for key, value in projection.items():
+            if value:
+                if _path_exists(doc, key):
+                    item = _get_item_from_doc(doc, key)
+                    _set_item_in_doc(projected_doc, key, item)
+        return projected_doc
+    else:  # exclusion mode
+        projected_doc = copy.deepcopy(doc)
+        for key, value in projection.items():
+            if not value:
+                _delete_item_in_doc(projected_doc, key)
+        return projected_doc
 
 
 def _make_idx_key(idx_key):
@@ -799,13 +947,13 @@ class Collection():
                     replacement['_id'] = replacement.get('_id') or bson.ObjectId()
                     self.__insert_one(replacement)
                     self.__update_indicies([replacement], metadata)
-                    return UpdateResult(0, 1, replacement['_id'])
-                return UpdateResult(0, 0)
+                    return UpdateResult(0, 0, replacement['_id'])
+                return UpdateResult(0, 0, None)
             replacement['_id'] = doc_id
             metadata = self.__get_metadata()
             assert self._engine.put_doc(self.full_name, replacement)
             self.__update_indicies([replacement], metadata)
-            return UpdateResult(1, 1)
+            return UpdateResult(1, 1, None)
 
     def __find_one_id(self, filter, sort=None, skip=None, upsert=False):
         """
@@ -830,11 +978,12 @@ class Collection():
         except StopIteration:
             return None
 
-    def __find_one(self, filter, sort, skip):
+    def __find_one(self, filter, projection, sort, skip):
         """
         Given the filter, return a single doc or None.
 
         :param filter dict:
+        :param projection dict|None:
         :param sort list[(key, direction)]|None
         :param skip int|None
         :rtype: dict|None
@@ -843,7 +992,8 @@ class Collection():
         if doc_id:
             doc = self._engine.get_doc(self.full_name, doc_id)
             if doc:
-                return copy.deepcopy(doc)
+                projected_doc = _apply_projection(doc, projection)
+                return copy.deepcopy(projected_doc)
 
     def __find_ids(self, filter, sort=None, limit=None, skip=None, metadata=None):
         """
@@ -908,24 +1058,25 @@ class Collection():
             for doc_id in doc_ids:
                 doc = self._engine.get_doc(self.full_name, doc_id)
                 if doc and _doc_matches_slow_filters(doc, slow_filters):
-                    yield doc['_id']
+                    yield doc_id
             return
 
         i = 0
         for doc_id in doc_ids:
             doc = self._engine.get_doc(self.full_name, doc_id)
             if _doc_matches_slow_filters(doc, slow_filters):
-                yield doc['_id']
+                yield doc_id
                 i += 1
                 if i == limit:
                     return
 
-    def __find(self, filter, sort=None, limit=None, skip=None, metadata=None, shallow=False):
+    def __find(self, filter, projection=None, sort=None, limit=None, skip=None, metadata=None, shallow=False):
         """
         Given a filter, find all docs that match this filter.
         This method returns a generator.
 
         :param filter dict:
+        :param projection dict|None:
         :param sort list[(key, direction)]|None:
         :param limit int|None:
         :param skip int|None:
@@ -934,21 +1085,23 @@ class Collection():
         """
         gen = self.__find_ids(filter, sort, limit, skip, metadata=metadata)
 
-        if shallow:
-            for doc_id in gen:
-                doc = self._engine.get_doc(self.full_name, doc_id)
+        for doc_id in gen:
+            doc = self._engine.get_doc(self.full_name, doc_id)
+            if projection:
+                doc = _apply_projection(doc, projection)
+
+            if shallow:
                 yield doc
-        else:
-            for doc_id in gen:
-                doc = self._engine.get_doc(self.full_name, doc_id)
+            else:
                 yield copy.deepcopy(doc)
 
     @support_alert
-    def find_one(self, filter=None, sort=None, skip=None):
+    def find_one(self, filter=None, projection=None, sort=None, skip=None):
         """
         Return the first matching document.
 
         :param filter dict:
+        :param projection dict|None:
         :param sort list[(key, direction)]|None:
         :param skip int|None:
         :rtype: dict|None
@@ -959,14 +1112,15 @@ class Collection():
 
         if sort is not None:
             sort = _validate_sort(sort)
-        return self.__find_one(filter, sort, skip)
+        return self.__find_one(filter, projection, sort, skip)
 
     @support_alert
-    def find(self, filter=None, sort=None, limit=None, skip=None):
+    def find(self, filter=None, projection=None, sort=None, limit=None, skip=None):
         """
         Return a cursor of all matching documents.
 
         :param filter dict:
+        :param projection dict|None:
         :param sort list[(key, direction)]|None:
         :param limit int|None:
         :param skip int|None:
@@ -988,81 +1142,128 @@ class Collection():
             if skip < 0:
                 raise ValueError('Skip must be >=0')
 
-        return Cursor(self.__find, filter, sort, limit, skip)
+        return Cursor(self.__find, filter, projection, sort, limit, skip)
 
-    def __update_doc(self, doc_id, update):
+    def __update_doc(self, doc_id, update, array_filters=None):
         """
         Given a doc_id and an update dict, find the document and safely update it.
         Returns the updated document
 
         :param doc_id str:
         :param update dict:
+        :param array_filters list|None:
         :rtype: dict
         """
         doc = self._engine.get_doc(self.full_name, doc_id)
         for update_op, update_op_dict in update.items():
-            _update_item_in_doc(update_op, update_op_dict, doc)
+            _update_item_in_doc(update_op, update_op_dict, doc, array_filters)
         assert self._engine.put_doc(self.full_name, doc)
         return dict(doc)
 
     @support_alert
-    def update_one(self, filter, update, upsert=False):
+    def update_one(self, filter, update, upsert=False, array_filters=None):
         """
         Find one document matching the filter and update it.
-        The 'upsert' parameter is not supported.
+        If upsert is True, insert a new document if none match.
 
         :param filter dict:
         :param update dict:
         :param upsert bool:
+        :param array_filters list:
         :rtype: results.UpdateResult
         """
+        if array_filters and not isinstance(array_filters, list):
+            raise MongitaError("array_filters must be a list")
 
         _validate_filter(filter)
         _validate_update(update)
         self.__create()
-        if upsert:
-            raise MongitaNotImplementedError("Mongita does not support 'upsert' on "
-                                             "update operations. Use `replace_one`.")
 
         with self._engine.lock:
-            doc_ids = list(self.__find_ids(filter))
-            matched_count = len(doc_ids)
-            if not matched_count:
-                return UpdateResult(matched_count, 0)
+            doc_id = self.__find_one_id(filter)
+
+            if doc_id:
+                metadata = self.__get_metadata()
+                doc = self.__update_doc(doc_id, update, array_filters)
+                self.__update_indicies([doc], metadata)
+                return UpdateResult(1, 1, None)
+
+            if not upsert:
+                return UpdateResult(0, 0, None)
+
+            # Upsert logic
+            new_doc = {}
+            for key, value in filter.items():
+                if isinstance(value, dict) and '$eq' in value:
+                    value = value['$eq']
+                if not isinstance(value, dict):
+                    ds, last_key = _get_datastructure_from_doc(new_doc, key)
+                    if ds is not None:
+                        ds[last_key] = value
+
+            for update_op, update_op_dict in update.items():
+                _update_item_in_doc(update_op, update_op_dict, new_doc)
+
+            new_doc['_id'] = new_doc.get('_id') or filter.get('_id') or bson.ObjectId()
+
             metadata = self.__get_metadata()
-            doc = self.__update_doc(doc_ids[0], update)
-            self.__update_indicies([doc], metadata)
-        return UpdateResult(matched_count, 1)
+            self.__insert_one(new_doc)
+            self.__update_indicies([new_doc], metadata)
+            return UpdateResult(0, 0, new_doc['_id'])
 
     @support_alert
-    def update_many(self, filter, update, upsert=False):
+    def update_many(self, filter, update, upsert=False, array_filters=None):
         """
         Update every document matched by the filter.
-        The 'upsert' parameter is not supported.
+        If upsert is True, insert a new document if none match.
 
         :param filter dict:
         :param update dict:
         :param upsert bool:
+        :param array_filters list:
         :rtype: results.UpdateResult
         """
+        if array_filters and not isinstance(array_filters, list):
+            raise MongitaError("array_filters must be a list")
+
         _validate_filter(filter)
         _validate_update(update)
         self.__create()
-        if upsert:
-            raise MongitaNotImplementedError("Mongita does not support 'upsert' "
-                                             "on update operations. Use `replace_one`.")
 
-        success_docs = []
-        matched_cnt = 0
         with self._engine.lock:
             doc_ids = list(self.__find_ids(filter))
+
+            if doc_ids:
+                success_docs = []
+                metadata = self.__get_metadata()
+                for doc_id in doc_ids:
+                    doc = self.__update_doc(doc_id, update, array_filters)
+                    success_docs.append(doc)
+                self.__update_indicies(success_docs, metadata)
+                return UpdateResult(len(doc_ids), len(success_docs), None)
+
+            if not upsert:
+                return UpdateResult(0, 0, None)
+
+            # Upsert logic - insert one document
+            new_doc = {}
+            for key, value in filter.items():
+                if isinstance(value, dict) and '$eq' in value:
+                    value = value['$eq']
+                if not isinstance(value, dict):
+                    ds, last_key = _get_datastructure_from_doc(new_doc, key)
+                    if ds is not None:
+                        ds[last_key] = value
+
+            for update_op, update_op_dict in update.items():
+                _update_item_in_doc(update_op, update_op_dict, new_doc)
+
+            new_doc['_id'] = new_doc.get('_id') or filter.get('_id') or bson.ObjectId()
+
             metadata = self.__get_metadata()
-            for doc_id in doc_ids:
-                doc = self.__update_doc(doc_id, update)
-                success_docs.append(doc)
-                matched_cnt += 1
-            self.__update_indicies(success_docs, metadata)
-        return UpdateResult(matched_cnt, len(success_docs))
+            self.__insert_one(new_doc)
+            self.__update_indicies([new_doc], metadata)
+            return UpdateResult(0, 0, new_doc['_id'])
 
     @support_alert
     def delete_one(self, filter):
